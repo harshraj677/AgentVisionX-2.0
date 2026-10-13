@@ -1,15 +1,14 @@
 """OPT-IN integration tests against a REAL PostgreSQL + pgvector database.
 
-Skipped unless TEST_DATABASE_URL is set AND its database name contains "test" (so production data is never touched).
+Skipped unless TEST_DATABASE_URL points at a LOCAL database whose name contains "test" as a separate word and that is not
+the app's own DATABASE_URL (see tests/pg_guard.py), so production data is never touched. No DROP/TRUNCATE is ever issued.
 Example (Docker):  docker run -d --name avx-pg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=avx_test -p 5433:5432 pgvector/pgvector:pg17
                    $env:TEST_DATABASE_URL = "postgresql://postgres:pw@localhost:5433/avx_test"
 Rows created here use random owner scopes and are deleted afterwards.
 """
 import asyncio
 import hashlib
-import os
 import uuid
-from urllib.parse import urlsplit
 
 import pytest
 
@@ -18,14 +17,12 @@ from app.documents.chunking import Chunk
 from app.documents.embeddings import normalize
 from app.documents.files import Page
 from app.documents.store import PostgresDocumentStore
+from tests.pg_guard import safe_test_database
 
-DSN = os.environ.get("TEST_DATABASE_URL", "")
+DSN, SKIP_REASON = safe_test_database()
 DIMS = 768
 
-pytestmark = [
-    pytest.mark.skipif(not DSN, reason="set TEST_DATABASE_URL to a disposable PostgreSQL+pgvector database to run"),
-    pytest.mark.skipif(bool(DSN) and "test" not in urlsplit(DSN).path.lower(), reason="refusing: database name must contain 'test'"),
-]
+pytestmark = pytest.mark.skipif(DSN is None, reason=SKIP_REASON)
 
 
 def owner() -> str:
@@ -114,6 +111,9 @@ def test_reindex_replaces_the_previous_version(store):
     rec = run(store.store_chunks(a, doc.id, [Chunk(0, 1, "new"), Chunk(1, 1, "newer")], [vec(3), vec(4)], "m", DIMS))
     assert rec.index_version == 2 and rec.chunk_count == 2 and rec.status == "ready"
     assert sorted(h.text for h in run(store.search(a, [doc.id], vec(3), 10))) == ["new", "newer"]
+    # The old version must be physically gone too (retention): search ignores it by version, so count the rows.
+    state, rows = _doc_state(store, a, doc.id)
+    assert rows == 2 and state == ("ready", 2, 2)
 
 
 def test_delete_cascades_to_pages_and_chunks_but_keeps_the_audit_event(store):
@@ -133,3 +133,60 @@ def test_delete_cascades_to_pages_and_chunks_but_keeps_the_audit_event(store):
 def test_updates_are_limited_to_whitelisted_columns(store):
     with pytest.raises(ValueError):
         run(store.update_document(new_owner(store), str(uuid.uuid4()), owner_scope="someone-else"))
+
+
+# ---- atomicity: a failed write must never leave a half-indexed or mis-marked document ----------------------------------
+
+def _doc_state(store, o, doc_id):
+    import psycopg
+
+    with psycopg.connect(DSN) as conn:
+        doc = conn.execute("SELECT status, index_version, chunk_count FROM rag_documents WHERE id = %s", (uuid.UUID(doc_id),)).fetchone()
+        n = conn.execute("SELECT count(*) FROM rag_chunks WHERE document_id = %s", (uuid.UUID(doc_id),)).fetchone()[0]
+    return doc, n
+
+
+def test_failed_first_indexing_leaves_no_chunks_and_document_not_marked_ready(store):
+    from app.documents.store import StoreUnavailable
+
+    a = new_owner(store)
+    doc, _ = make_doc(store, a)
+    dup = [Chunk(0, 1, "one"), Chunk(0, 1, "same index again")]  # violates UNIQUE (document_id, index_version, chunk_index)
+    with pytest.raises(StoreUnavailable):
+        run(store.store_chunks(a, doc.id, dup, [vec(1), vec(2)], "m", DIMS))
+    state, n = _doc_state(store, a, doc.id)
+    assert n == 0 and state == ("processing", 0, 0)  # the transaction rolled back completely
+
+
+def test_failed_reindex_keeps_the_previous_version_searchable(store):
+    from app.documents.store import StoreUnavailable
+
+    a = new_owner(store)
+    doc, _ = make_doc(store, a)
+    run(store.store_chunks(a, doc.id, [Chunk(0, 1, "good old passage")], [vec(7)], "m", DIMS))
+    with pytest.raises(StoreUnavailable):
+        run(store.store_chunks(a, doc.id, [Chunk(0, 1, "x"), Chunk(0, 1, "y")], [vec(8), vec(9)], "m", DIMS))
+    state, n = _doc_state(store, a, doc.id)
+    assert state == ("ready", 1, 1) and n == 1
+    assert [h.text for h in run(store.search(a, [doc.id], vec(7), 5))] == ["good old passage"]
+
+
+def test_search_with_no_matching_documents_or_invalid_ids_returns_nothing(store):
+    a = new_owner(store)
+    assert run(store.search(a, [], vec(1), 5)) == []
+    assert run(store.search(a, ["not-a-uuid", str(uuid.uuid4())], vec(1), 5)) == []
+    assert run(store.get_document(a, "not-a-uuid")) is None
+    assert run(store.delete_document(a, "not-a-uuid")) is False
+
+
+def test_search_is_restricted_to_the_selected_documents_of_the_same_owner(store):
+    a = new_owner(store)
+    d1, _ = make_doc(store, a)
+    d2, _ = make_doc(store, a)
+    run(store.store_chunks(a, d1.id, [Chunk(0, 1, "from document one")], [vec(10)], "m", DIMS))
+    run(store.store_chunks(a, d2.id, [Chunk(0, 1, "from document two")], [vec(10)], "m", DIMS))  # identical vector: equally relevant
+
+    assert [h.document_id for h in run(store.search(a, [d1.id], vec(10), 10))] == [d1.id]
+    assert [h.document_id for h in run(store.search(a, [d2.id], vec(10), 10))] == [d2.id]
+    both = run(store.search(a, [d1.id, d2.id], vec(10), 10))
+    assert {h.document_id for h in both} == {d1.id, d2.id}

@@ -196,9 +196,19 @@ Home → Documents: upload (PDF/TXT picker), list with status (Ready / Needs pri
 
 - Stored document text and **embeddings are sensitive data**: embeddings can leak information about the source text. Protect the database like the documents themselves. Text awaiting a privacy decision is stored server-side until you decide or delete.
 - With `confirm`, the text (e.g. names) is sent to the embedding provider and, as passages, to the answering model.
-- Isolation is enforced in SQL (`owner_scope` on every query). It is covered by opt-in tests against a real database (`tests/test_documents_postgres.py`, needs `TEST_DATABASE_URL` pointing at a disposable database whose name contains `test`).
+- Isolation is enforced in SQL (`owner_scope` on every query, plus the selected document IDs and `status = 'ready'` and the current `index_version` on search). It is covered by opt-in tests against a real database.
 - The HNSW index needs no minimum data. With filtering by owner/document, an approximate index scan can return fewer than `top_k` rows for very selective filters; small per-user corpora are usually served by the `owner_scope` B-tree instead.
 - Only UTF-8 TXT; no OCR, DOCX or images. Injection defenses are heuristic (see Research).
+
+**Real-database tests (opt-in).** `tests/test_documents_postgres.py` (store: isolation, similarity ordering, selected-document filter, re-index replacement and physical cleanup of old versions, atomic rollback on failure, delete cascade, migration idempotency) and `tests/test_documents_postgres_e2e.py` (upload -> privacy review -> redaction -> index -> ask -> citations -> isolation -> delete through the real HTTP API and real service; embeddings and the answering model are mocked, and the tests say so). They run only when `TEST_DATABASE_URL` passes `tests/pg_guard.py`: a **local** host, a database name containing `test` as a separate word (`avx_test`; `latest_data` is refused), and not equal to `DATABASE_URL`. The guard itself is tested on every run, with no database needed, by `tests/test_pg_guard.py`. They never DROP or TRUNCATE; they delete only rows they created. Without a valid test database they are skipped.
+
+```powershell
+docker run -d --name avx-pg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=avx_test -p 5433:5432 pgvector/pgvector:pg17
+$env:DATABASE_URL = "postgresql://postgres:pw@localhost:5433/avx_test"; python -m app.db.migrate
+$env:TEST_DATABASE_URL = "postgresql://postgres:pw@localhost:5433/avx_test"; python -m pytest tests/test_documents_postgres.py tests/test_documents_postgres_e2e.py -v
+```
+
+**Verification status (be aware).** The real-database tests above were run against a real PostgreSQL 16 server, but on the development machine the bundled pgvector library crashed the server (illegal CPU instruction) on `CREATE EXTENSION vector`, so there the pgvector type, the `<=>` operator and the HNSW index were *emulated* (a text-based stand-in with a SQL cosine function) while the rest of the migration SQL and all store queries ran unmodified. **The real pgvector extension, the HNSW index, vector dimension enforcement and real Gemini embeddings have therefore not been verified here.** Run the commands above against the pgvector Docker image to verify them. Note for large corpora: with filters on owner/document an HNSW scan can return fewer than `top_k` rows; pgvector 0.8 offers `SET hnsw.iterative_scan = relaxed_order` to mitigate this (not enabled yet).
 
 ## Research
 
