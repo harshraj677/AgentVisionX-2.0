@@ -1,0 +1,15 @@
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+pydantic-settings==2.15.0
+google-genai==2.29.0
+presidio-analyzer==2.2.364
+spacy==3.8.16
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+tiktoken==0.14.0
+httpx==0.28.1  # Tavily REST client (also used by the test client)
+psycopg[binary]==3.3.6  # PostgreSQL + pgvector (documents)
+psycopg-pool==3.3.3
+pypdf==6.20.1  # PDF text extraction (parses only; never executes PDF content)
+python-multipart==0.0.32  # file uploads
+# test-only
+pytest==9.1.1
