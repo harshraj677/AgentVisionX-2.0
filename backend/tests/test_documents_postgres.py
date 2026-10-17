@@ -190,3 +190,22 @@ def test_search_is_restricted_to_the_selected_documents_of_the_same_owner(store)
     assert [h.document_id for h in run(store.search(a, [d2.id], vec(10), 10))] == [d2.id]
     both = run(store.search(a, [d1.id, d2.id], vec(10), 10))
     assert {h.document_id for h in both} == {d1.id, d2.id}
+
+
+def test_real_pgvector_type_dimensions_operator_and_hnsw_index(store):
+    """Guards against a stand-in: needs the real `vector` extension, fixed dimensions, `<=>` and the HNSW index."""
+    import psycopg
+
+    with psycopg.connect(DSN) as conn:
+        ext = conn.execute("SELECT extversion FROM pg_extension WHERE extname='vector'").fetchone()
+        assert ext is not None, "pgvector extension is not installed"
+        col = conn.execute(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+            "WHERE attrelid='rag_chunks'::regclass AND attname='embedding'"
+        ).fetchone()[0]
+        assert col == f"vector({DIMS})"
+        idx = conn.execute("SELECT indexdef FROM pg_indexes WHERE indexname='rag_chunks_embedding_hnsw'").fetchone()[0]
+        assert "USING hnsw" in idx and "vector_cosine_ops" in idx
+        assert conn.execute("SELECT '[1,0]'::vector <=> '[0,1]'::vector").fetchone()[0] == pytest.approx(1.0)
+        with pytest.raises(psycopg.errors.DataException):
+            conn.execute("SELECT '[1,2,3]'::vector(%s)" % DIMS)
