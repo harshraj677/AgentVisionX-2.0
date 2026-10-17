@@ -13,7 +13,8 @@ A privacy-aware AI gateway (MVP): a React Native / Expo app talks to a FastAPI b
 - Research: one Tavily web search per question, an answer that cites the returned sources, citation and link validation. See "Research".
 - Response privacy: every AI reply is scanned locally before it reaches the app; secrets are redacted by default. See "Response privacy".
 - Model router: local task classification, five routing policies, bounded fallback, routing explanations in every response. See "Model routing".
-- Backend: `GET /health`, `GET /api/router/models`, `POST /api/chat`, `POST /api/privacy/scan`, `POST /api/privacy/redact`, `POST /api/optimize`, request IDs, validation, size/timeout limits, provider abstraction, real Gemini adapter (`google-genai`).
+- Backend: `GET /health` (liveness), `GET /api/ready` (database readiness), `GET /api/router/models`, `POST /api/chat`, `POST /api/privacy/scan`, `POST /api/privacy/redact`, `POST /api/optimize`, `POST /api/research`, the `/api/documents` endpoints, request IDs, validation, size/timeout limits, provider abstraction, real Gemini adapter (`google-genai`).
+- Reliability: the Settings screen separates "backend unreachable" from "backend up but documents database unavailable", validates and normalises the Backend URL, and documents whose indexing job crashed are recovered automatically (see "Stale indexing recovery").
 - Token counts come from Gemini's `usage_metadata`. If missing, the app shows "Unavailable". Nothing is estimated.
 - Voice is clearly marked **Coming soon**. The OpenAI adapter only returns a "not configured / not implemented" error.
 
@@ -24,6 +25,28 @@ agentvision-x/
 ├── backend/   FastAPI (app/api, core, schemas, services, providers) + tests
 └── mobile/    Expo Router app (app, components, constants, hooks, services, types)
 ```
+
+## Architecture
+
+```
+ Phone (Expo Go)                      PC (Windows)
+┌──────────────────┐   HTTP, LAN   ┌────────────────────────────────────────────┐
+│ React Native app │ ────────────▶ │ FastAPI backend  (uvicorn, port 8000)      │
+│ Expo Router      │  X-Document-  │  privacy engine ─ input + response scans   │
+│ no API keys      │  Scope header │  prompt optimizer, model router            │      ┌────────────┐
+└──────────────────┘               │  chat / research / documents services ─────┼────▶ │ Gemini API │
+                                   │                                            │      │ Tavily API │
+                                   │  document store (psycopg pool)             │      └────────────┘
+                                   └───────────────┬────────────────────────────┘
+                                                   ▼
+                                    PostgreSQL 17 + pgvector (Docker, 127.0.0.1:5432)
+                                    documents, pages, chunks + embeddings (HNSW), audit events
+```
+
+- **Mobile** (`mobile/`): Expo Router screens (`app/`), reusable `components/`, `hooks/` (conversations, health, prompt review), `services/` (API client with timeouts and response validation, config, storage, document scope) and `types/`. It holds no provider keys; the Backend URL is `EXPO_PUBLIC_API_URL` or the value saved in Settings.
+- **Backend** (`backend/app/`): `api/routes.py` (HTTP), `services/` (chat, documents, research, privacy, optimizer), `privacy/` (Presidio + custom rules, input and response policies), `router/` (task classification, policies, fallback), `providers/` (Gemini adapter), `documents/` (file extraction, chunking, embeddings, the PostgreSQL store, grounding), `research/` (Tavily) and `db/` (SQL migrations and the runner).
+- **Database**: PostgreSQL with the `vector` extension. Schema changes are numbered SQL files in `backend/app/db/migrations/`, applied once each by `python -m app.db.migrate`.
+- **Secrets** live only in `backend/.env` (git-ignored). The mobile app never receives them.
 
 ## Quick start (Windows, PowerShell)
 
@@ -76,6 +99,40 @@ Press `a` for the Android emulator, or scan the QR code with Expo Go.
 You can also change the URL inside the app: **Settings → Backend URL → Save & test**. It's remembered on the device. After editing `.env`, restart with `npx expo start -c`.
 
 For a physical phone, the backend must be started with `--host 0.0.0.0` (as above), and Windows Firewall must allow Python on private networks (allow the prompt, or run once as admin: `New-NetFirewallRule -DisplayName "AgentVision API" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow -Profile Private`). Test from the phone's browser: `http://<PC IP>:8000/health`.
+
+### Starting everything safely (each time)
+
+1. **Database first** (only needed for Documents): make sure Docker Desktop is running and `agentvision-pg` is started (`docker start agentvision-pg`; with `--restart unless-stopped` it starts with Docker). If the database comes up after the backend, the backend reconnects by itself within seconds.
+2. **Backend**, from `backend\`, using the project's own interpreter (no activation script needed): `.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000`. After pulling new code run `.\.venv\Scripts\python.exe -m app.db.migrate` once (see "Database migrations").
+3. **Expo**, from `mobile\`: `npx expo start -c` (the `-c` is only needed after changing `.env`). To make sure Expo advertises the Wi-Fi address and not a virtual adapter (e.g. WSL), set `$env:REACT_NATIVE_PACKAGER_HOSTNAME = "<PC IP>"` first.
+4. **Stop**: Ctrl+C in each terminal; `docker stop agentvision-pg` if you want the database off.
+
+### Checking the phone-to-backend connection
+
+Do these in order; the first one that fails shows where the problem is.
+
+1. Phone on the **same Wi-Fi** as the PC, mobile data off.
+2. In the phone's **browser**, open `http://<PC IP>:8000/health`. Expected: JSON with `"status":"ok"`. If it does not load, the problem is the network, not the app: Windows Firewall (rule above; Windows may classify the Wi-Fi as *Public*), or router/AP "client isolation" (common on guest and some ISP/mesh networks), or the wrong IP.
+3. Open `http://<PC IP>:8000/api/ready`. Expected: `{"status":"ok","database":"ok"}` (see the next section for other values).
+4. In the app: **Settings → Backend URL** (you may type `192.168.1.23:8000`; `http://` is added), **Save & test**, then **Check connection** at any time. Settings shows backend status and the documents database state.
+
+### `/health` versus `/api/ready`
+
+| Endpoint | Question it answers | Depends on |
+|---|---|---|
+| `GET /health` | Is the server process up? (liveness) Which providers have keys, is the privacy engine loaded, is a database *configured*? | Nothing external. Never touches the database or an AI provider. `database_configured: true` only means `DATABASE_URL` is set, **not** that the database is reachable. |
+| `GET /api/ready` | Can the backend actually reach its documents database? (readiness) | One cheap check (`to_regclass` on `rag_meta`, 3-second connect timeout, on its own short connection). Never calls an AI provider. |
+
+`/api/ready` always returns HTTP 200 while the server is up (chat, privacy and research work without a database), as `{ "status": "ok" | "degraded", "database": ... }`:
+
+| `database` | Meaning | What to do |
+|---|---|---|
+| `ok` | Reachable and migrated | Nothing |
+| `not_configured` | `DATABASE_URL` is empty (`status` is still `ok`) | Set it, see "Documents (RAG)" |
+| `not_migrated` | Reachable, but the tables are missing | `python -m app.db.migrate` |
+| `unavailable` | Cannot connect (down, wrong credentials, wrong port) | Start PostgreSQL / Docker; the backend reconnects by itself |
+
+No connection string, credentials or driver error text are ever returned.
 
 ## Privacy engine
 
@@ -132,14 +189,34 @@ An invalid action fails at startup. Restart uvicorn after editing.
 
 ### Setup (Windows)
 
-1. **PostgreSQL with pgvector.** Easiest is Docker Desktop:
+1. **PostgreSQL with pgvector.** Easiest is Docker Desktop. Use a strong password (generate one; do not reuse the example), a **named volume** so data survives container removal, and bind the port to `127.0.0.1` so the database is not reachable from your LAN:
    ```powershell
-   docker run -d --name agentvision-pg -e POSTGRES_PASSWORD=change-me -e POSTGRES_DB=agentvision -p 5432:5432 -v agentvision-pg:/var/lib/postgresql/data pgvector/pgvector:pg17
+   $env:POSTGRES_PASSWORD = "<strong password>"      # only in this terminal session
+   docker run -d --name agentvision-pg --restart unless-stopped -e POSTGRES_PASSWORD -e POSTGRES_DB=agentvision -p 127.0.0.1:5432:5432 -v agentvision-pg:/var/lib/postgresql/data pgvector/pgvector:pg17
+   Remove-Item Env:POSTGRES_PASSWORD
    ```
-   (Or install PostgreSQL and the pgvector extension natively.)
-2. In `backend/.env`: `DATABASE_URL=postgresql://postgres:change-me@localhost:5432/agentvision` and `GEMINI_API_KEY=...` (used for embeddings).
-3. Create the tables: `python -m app.db.migrate` (`--status` lists pending migrations). The first migration fixes the vector size to `EMBEDDING_DIMENSIONS` (default 768); changing it later needs a new migration and re-indexing.
-4. Restart uvicorn. `/health` shows `documents.database_configured` / `embedding_configured`.
+   (`-e POSTGRES_PASSWORD` without a value passes the variable through, so the password does not appear in the command line.) Tested with PostgreSQL 17.11 and pgvector 0.8.7. You can also install PostgreSQL and pgvector natively; note that a Windows pgvector build compiled for a newer CPU than yours can crash the server on `CREATE EXTENSION vector`, which the official Docker image avoids. Docker Desktop keeps its data in a virtual disk (its location is a Docker setting); keep an eye on the free space of that drive.
+   - **Never use the test database (`avx_test`) for real documents.**
+2. In `backend/.env` (git-ignored; never put the real URL in a tracked file): `DATABASE_URL=postgresql://postgres:<password>@127.0.0.1:5432/agentvision` and `GEMINI_API_KEY=<your key>` (also used for embeddings).
+3. Create the tables: `python -m app.db.migrate` (see "Database migrations"). The first migration fixes the vector size to `EMBEDDING_DIMENSIONS` (default 768); changing it later needs a new migration and re-indexing.
+4. Restart uvicorn. `/health` shows `documents.database_configured` / `embedding_configured` (configured, not proven reachable); `/api/ready` shows whether the database is actually reachable.
+
+### Database migrations
+
+Migrations are the numbered files in `backend/app/db/migrations/`. The runner applies each pending file once, in order, inside a transaction together with its `schema_migrations` record, so a failing migration leaves **no partial schema and no record** and can simply be re-run after fixing the cause.
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m app.db.migrate --status   # lists pending migrations, changes nothing
+.\.venv\Scripts\python.exe -m app.db.migrate            # applies them; running it again prints "nothing (up to date)"
+```
+
+| File | Adds |
+|---|---|
+| `001_documents.sql` | `vector` extension; `rag_documents`, `rag_document_pages`, `rag_chunks` (`vector(EMBEDDING_DIMENSIONS)` + HNSW cosine index), `rag_document_events`, `rag_meta` |
+| `002_indexing_lease.sql` | nullable `rag_documents.indexing_started_at` (the indexing lease, see below). Additive; existing rows are untouched |
+
+A new environment runs `001` then `002`. An existing database upgrades with a single `python -m app.db.migrate` after updating the code. **Run it before starting the updated backend**: without `002`, document operations fail with `documents_database_unavailable`. Both paths (fresh install and upgrade of a database that already holds documents) were checked, including repeat runs.
 
 ### Who can see a document (development-mode scope)
 
@@ -162,7 +239,19 @@ There are no user accounts yet. Each app install generates a random 256-bit **sc
 7. Embeddings: `EMBEDDING_MODEL` (default `gemini-embedding-001`, task type `RETRIEVAL_DOCUMENT`), vectors L2-normalised and their length checked against `EMBEDDING_DIMENSIONS`. Failures (`embedding_rate_limited`, `embedding_timeout`, …) mark the document `failed` with that code and store no chunks; `POST /api/documents/{id}/reindex` retries. Missing credentials reject the upload up front (`503 embedding_not_configured`).
 8. Chunks, embeddings, model name and an `index_version` are stored in one transaction; re-indexing replaces the previous version atomically.
 
-Other endpoints: `GET /api/documents`, `GET /api/documents/{id}`, `DELETE /api/documents/{id}` (deletes the document, its stored text, chunks and embeddings via `ON DELETE CASCADE`; only a content-free audit event remains).
+Other endpoints: `GET /api/documents`, `GET /api/documents/{id}`, `DELETE /api/documents/{id}` (deletes the document, its stored text, chunks and embeddings via `ON DELETE CASCADE`; only a content-free audit event remains; if only that audit write fails the delete still succeeds).
+
+### Document states and stale indexing recovery
+
+`processing` (indexing is running) → `ready` | `needs_review` (waiting for your privacy decision) | `failed` (with a safe `error_code`; retry with `POST /api/documents/{id}/reindex`, the app's *Retry indexing*).
+
+**Lease.** Every indexing job holds a lease in `rag_documents.indexing_started_at`. It is taken atomically (one conditional `UPDATE`) when the document is uploaded, or when a privacy decision or re-index starts, and released when the job finishes or fails. A second request for a document whose lease is still live gets `409 document_indexing_in_progress`, so two requests (e.g. a double tap) cannot index the same document twice.
+
+**Recovery.** If the backend crashes or is killed mid-indexing, the lease is never released. A lease older than the stale timeout is treated as dead: whenever documents are listed, fetched or retried, that owner's `processing` documents with an expired lease are marked `failed` with `error_code: "indexing_interrupted"` (and an audit event), so the app shows *Retry indexing*. Recovery only changes the status: **nothing is deleted** (text, pages and any existing chunks stay), it acts only on the requesting scope's documents, and it is idempotent. A job that is still running keeps a fresh lease and is never recovered.
+
+**Timeout.** `INDEXING_STALE_SECONDS` (default `900`, minimum `120`). The backend never uses less than the worst-case duration of a healthy job, `ceil(MAX_CHUNKS_PER_DOCUMENT / EMBEDDING_BATCH_SIZE) × (EMBEDDING_TIMEOUT_SECONDS + 5) + 60` seconds (620 with the defaults), so raising the embedding timeout or chunk limit automatically lengthens the window.
+
+Limits: a document that crashed *before its privacy review finished* has no recorded decision and cannot be retried (that would skip the review): delete it and upload again. If the backend crashes during a *re*-index, a retry is refused with `document_indexing_in_progress` until the stale timeout passes. A re-index that fails marks a previously `ready` document `failed` until the retry succeeds.
 
 ### Asking
 
@@ -200,15 +289,17 @@ Home → Documents: upload (PDF/TXT picker), list with status (Ready / Needs pri
 - The HNSW index needs no minimum data. With filtering by owner/document, an approximate index scan can return fewer than `top_k` rows for very selective filters; small per-user corpora are usually served by the `owner_scope` B-tree instead.
 - Only UTF-8 TXT; no OCR, DOCX or images. Injection defenses are heuristic (see Research).
 
-**Real-database tests (opt-in).** `tests/test_documents_postgres.py` (store: isolation, similarity ordering, selected-document filter, re-index replacement and physical cleanup of old versions, atomic rollback on failure, delete cascade, migration idempotency) and `tests/test_documents_postgres_e2e.py` (upload -> privacy review -> redaction -> index -> ask -> citations -> isolation -> delete through the real HTTP API and real service; embeddings and the answering model are mocked, and the tests say so). They run only when `TEST_DATABASE_URL` passes `tests/pg_guard.py`: a **local** host, a database name containing `test` as a separate word (`avx_test`; `latest_data` is refused), and not equal to `DATABASE_URL`. The guard itself is tested on every run, with no database needed, by `tests/test_pg_guard.py`. They never DROP or TRUNCATE; they delete only rows they created. Without a valid test database they are skipped.
+**Real-database tests (opt-in).** `tests/test_documents_postgres.py` (store: isolation, similarity ordering, selected-document filter, re-index replacement and physical cleanup of old versions, atomic rollback on failure, delete cascade, migration idempotency, the indexing lease and stale recovery in SQL, the readiness probe, and connection-pool recovery after a database outage) and `tests/test_documents_postgres_e2e.py` (upload -> privacy review -> redaction -> index -> ask -> citations -> isolation -> delete through the real HTTP API and real service; embeddings and the answering model are mocked, and the tests say so). They run only when `TEST_DATABASE_URL` passes `tests/pg_guard.py`: a **local** host, a database name containing `test` as a separate word (`avx_test`; `latest_data` is refused), and not equal to `DATABASE_URL`. The guard itself is tested on every run, with no database needed, by `tests/test_pg_guard.py`. They never DROP or TRUNCATE; they delete only rows they created. Without a valid test database they are skipped.
 
 ```powershell
-docker run -d --name avx-pg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=avx_test -p 5433:5432 pgvector/pgvector:pg17
-$env:DATABASE_URL = "postgresql://postgres:pw@localhost:5433/avx_test"; python -m app.db.migrate
-$env:TEST_DATABASE_URL = "postgresql://postgres:pw@localhost:5433/avx_test"; python -m pytest tests/test_documents_postgres.py tests/test_documents_postgres_e2e.py -v
+# A SEPARATE, disposable container: never your real documents database. The throwaway password "pw" is only acceptable
+# because the port is bound to localhost and the data is disposable.
+docker run -d --name avx-pg-test -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=avx_test -p 127.0.0.1:5433:5432 pgvector/pgvector:pg17
+$env:TEST_DATABASE_URL = "postgresql://postgres:pw@127.0.0.1:5433/avx_test"
+python -m pytest tests/test_documents_postgres.py tests/test_documents_postgres_e2e.py -v   # the tests migrate this database themselves
 ```
 
-**Verification status (be aware).** The real-database tests above were run against a real PostgreSQL 16 server, but on the development machine the bundled pgvector library crashed the server (illegal CPU instruction) on `CREATE EXTENSION vector`, so there the pgvector type, the `<=>` operator and the HNSW index were *emulated* (a text-based stand-in with a SQL cosine function) while the rest of the migration SQL and all store queries ran unmodified. **The real pgvector extension, the HNSW index, vector dimension enforcement and real Gemini embeddings have therefore not been verified here.** Run the commands above against the pgvector Docker image to verify them. Note for large corpora: with filters on owner/document an HNSW scan can return fewer than `top_k` rows; pgvector 0.8 offers `SET hnsw.iterative_scan = relaxed_order` to mitigate this (not enabled yet).
+**Verification status.** The real-database suites above were run against PostgreSQL 17.11 with the real pgvector 0.8.7 extension (official `pgvector/pgvector:pg17` image): the `vector(768)` type, the `<=>` cosine operator, the HNSW index, dimension enforcement, migrations (fresh install, upgrade and repeat runs) and the recovery logic. A live run with a real Gemini key and a synthetic document also passed on the development machine: chat, 768-dimension `gemini-embedding-001` embeddings, indexing, retrieval of the expected passage with a correct citation, scope isolation, deletion and cleanup. That live run is a manual check, not part of the automated suite, and the full document workflow **on a physical phone has not been verified**. Note for large corpora: with filters on owner/document an HNSW scan can return fewer than `top_k` rows; pgvector 0.8 offers `SET hnsw.iterative_scan = relaxed_order` to mitigate this (not enabled yet).
 
 ## Research
 
@@ -389,6 +480,7 @@ Then open the request details sheet in the app (task type, policy, provider/mode
 | `PROVIDER_TIMEOUT_SECONDS` | 30 | Per Gemini call |
 | `MAX_MESSAGE_CHARS` / `MAX_MESSAGES` / `MAX_REQUEST_BYTES` | 8000 / 40 / 200000 | Request limits |
 | `DATABASE_URL`, `EMBEDDING_*`, `DOCUMENT_*`, `CHUNK_*`, `MAX_CHUNKS_PER_DOCUMENT`, `RAG_*` | see `.env.example` | Documents (see above) |
+| `INDEXING_STALE_SECONDS` | 900 (min 120) | Age after which an indexing lease is treated as crashed (see "Document states and stale indexing recovery") |
 | `TAVILY_API_KEY`, `TAVILY_TIMEOUT_SECONDS`, `RESEARCH_MAX_RESULTS`, `RESEARCH_MAX_SOURCE_CHARS`, `RESEARCH_MAX_TOTAL_SOURCE_CHARS`, `RESEARCH_MAX_QUERY_CHARS`, `RESEARCH_DEFAULT_DEPTH` | none, 15, 5, 1500, 8000, 400, `basic` | Research (see above) |
 | `RESPONSE_PRIVACY_MODE`, `RESPONSE_PRIVACY_POLICY`, `RESPONSE_PRIVACY_DEFAULT_ACTION`, `RESPONSE_PRIVACY_MAX_CHARS` | `policy`, `{}`, `warn`, 200000 | Reply scanning (see above) |
 | `GEMINI_MODELS`, `ROUTER_*`, `MODEL_PROFILES` | see above | Router settings; full list with comments in `.env.example` |
@@ -421,16 +513,23 @@ Privacy endpoints: `POST /api/privacy/scan` with `{ "text": "..." }` returns `{ 
 
 Optimizer: `POST /api/optimize` with `{ "text": "..." }` returns `{ optimized_text, changed, changes: [{rule, description, count}], preservation: {verified, checks, note}, tokens: {basis: "estimate", method, note, original, optimized, saved, saved_percent}, privacy: {original, optimized} }` where `privacy` holds a local scan of each candidate. `POST /api/chat` accepts an optional `prompt_source` (`original` | `optimized` | `edited`) that is echoed in `metadata.prompt_source`.
 
+Health: `GET /health` returns `{ status: "ok", version, providers, privacy, research, documents }` and `GET /api/ready` returns `{ status: "ok" | "degraded", database: "ok" | "not_configured" | "not_migrated" | "unavailable" }` (see "`/health` versus `/api/ready`").
+
 Errors always look like `{ "error": { "code", "message", "request_id" } }`. Codes include `provider_not_configured` (503), `rate_limited` (429), `provider_auth_error`, `model_not_found`, `provider_timeout` (504), `validation_error` (422), `payload_too_large` (413).
 
 ## Testing
 
 ```powershell
 cd backend
-.\.venv\Scripts\python.exe -m pytest -q      # offline; no API key needed
+.\.venv\Scripts\python.exe -m pytest -q      # offline; no API key needed; real-database tests are skipped
+# with the real pgvector tests (needs the avx-pg-test container, see "Documents (RAG)"):
+$env:TEST_DATABASE_URL = "postgresql://postgres:pw@127.0.0.1:5433/avx_test"; .\.venv\Scripts\python.exe -m pytest -q
 cd ..\mobile
-npm run typecheck
+npm run typecheck                               # tsc --noEmit
+npm test                                        # node --test tests/*.test.mjs (needs Node 22.18+; no extra packages)
 ```
+
+Last full run on the development machine: backend 506 passed with the real pgvector database (without `TEST_DATABASE_URL` the real-database tests are skipped, so the count of passed tests is lower), mobile 9 passed, `tsc --noEmit` clean. There are no lint or formatter configurations in the repository. No test touches the network or needs an API key; the live Gemini calls and the mobile UI on a physical device are manual checks.
 
 The document tests cover upload validation (types by content, disguised and malformed files, encrypted/textless PDFs, size and Content-Length limits, filename sanitization), page-aware chunking, the embedding adapter (mocked SDK), ingestion privacy before any embedding call (redact/confirm rules, audit events, fail closed), owner isolation for every operation, deletion, retrieval thresholds/limits, insufficient evidence without a model call, citation and link validation, injection inside documents, response privacy on answers and excerpts, routing/fallback, and no content in logs. `tests/test_documents_postgres.py` runs the same isolation/search/cascade checks against a real PostgreSQL + pgvector database when `TEST_DATABASE_URL` is set (otherwise skipped). The research tests cover the Tavily adapter over a mock HTTP transport (request shape, normalization, every error class, malformed bodies, missing key with no request made), URL validation and de-duplication, result/text bounds, injection neutralisation, prompt construction, citation and link validation, and the endpoint end to end: privacy before search, no search on blocked/unconfirmed questions, no generation without evidence, bounded evidence, response privacy on answers and snippets, routing/fallback without repeated searches, no secrets or content in logs, and no network access. The response-privacy tests cover per-category detection and handling, false-positive regressions (placeholders, names, code, URLs, versions), all modes and overrides, redaction integrity (formatting, multiple spans, Unicode), fail-closed behaviour, block mode never returning the original, fallback replies being scanned without extra provider calls, input behaviour unchanged, and no secrets or reply text in logs/errors (including at DEBUG). The routing tests cover the classifier (every category plus unknown/ambiguous input), every policy, single-model and multi-model setups, missing credentials, ineligible/cooling-down models, manual validation, fallback allow/deny/bounds, privacy-before-routing for original/optimized/edited prompts, metadata and request IDs, backward-compatible response fields, no secrets or prompts in logs/errors, and no network access. The optimizer tests cover exact rewrites, idempotence, preservation of constraints/numbers/formats/quotes/code/secrets, the safety guard rejecting bad rewrites, token-estimate labelling, privacy enforcement on optimized and edited prompts, provider-call prevention (including with network access blocked), cancellation, and log hygiene. The privacy tests run the real Presidio engine: detection per category, benign text, redaction and re-scan, overlapping spans, emoji offsets, policy and overrides, edited and redacted prompts, blocked requests with a provider-call counter proving the provider is never reached, fail-closed behaviour, and checks that logs and error bodies contain no sensitive values. The live Gemini call and the mobile UI are not covered by automated tests.
 
@@ -445,9 +544,25 @@ The document tests cover upload validation (types by content, disguised and malf
 | `provider_auth_error` | Key invalid or restricted. Create a new one in AI Studio. |
 | `model_not_found` | Change `GEMINI_MODEL`. |
 | `rate_limited` | Free-tier quota. Wait, or enable billing. |
+| Settings says the documents database is unavailable | `docker ps` shows `agentvision-pg`? `docker start agentvision-pg`, wait a few seconds, tap **Check connection**. The backend reconnects by itself; no restart needed. |
+| Settings says the documents database is not set up | `python -m app.db.migrate` (also needed after pulling new code). |
+| `documents_database_unavailable` on every document action right after an update | Migration `002` has not been applied: `python -m app.db.migrate`. |
+| A document shows *Processing* for a long time | An indexing job is running or crashed. After `INDEXING_STALE_SECONDS` (default 15 minutes) it becomes *Failed: indexing interrupted* on the next refresh; then tap *Retry indexing* (or delete and re-upload if there is no retry button). |
+| `409 document_indexing_in_progress` | Another request is indexing that document (or a crashed re-index lease has not expired yet). Wait and refresh. |
+| `/health` works on the PC but not from the phone | Wi-Fi marked *Public* in Windows, firewall, or router client isolation: see "Checking the phone-to-backend connection". |
 | `Activate.ps1 cannot be loaded` | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | Android dev build blocks `http://` | Expo Go allows it. Standalone/dev builds need cleartext traffic enabled or an HTTPS URL. |
 | Expo shows stale env values | `npx expo start -c` |
+
+## Known limitations
+
+- Phone-to-backend connectivity and the full document workflow on a physical phone are unverified; only the laptop and automated tests were used.
+- There are no user accounts: documents are protected by a per-install bearer "scope key", which is not authentication.
+- No OCR (scanned PDFs are rejected), only PDF and UTF-8 TXT.
+- Stale-document recovery runs when documents are listed, fetched or retried (there is no background sweeper), and a document that crashed before its privacy review cannot be retried (delete and re-upload).
+- The privacy engine is heuristic and can miss sensitive data; `RAG_MIN_SIMILARITY` is not calibrated for your documents.
+- A single backend process with a small connection pool; HNSW with very selective filters can return fewer than `top_k` rows (see above).
+- Voice is not implemented; OpenAI and other providers are placeholders.
 
 ## Security notes
 
