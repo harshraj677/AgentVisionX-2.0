@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, File, Request, Response, UploadFile
 from app.core.errors import AppError
 from app.documents.scope import owner_scope
 
-from app.schemas.chat import ChatRequest, ChatResponse, DocumentsHealth, HealthResponse
+from app.schemas.chat import ChatRequest, ChatResponse, DocumentsHealth, HealthResponse, ReadyResponse
 from app.schemas.documents import AskRequest, AskResponse, DocumentList, DocumentOut, PrivacyDecisionRequest
 from app.schemas.research import ResearchRequest, ResearchResponse, ResearchStatus
 from app.schemas.routing import RouterModelsResponse
@@ -52,6 +52,13 @@ async def health(request: Request) -> HealthResponse:
             embedding_dimensions=request.app.state.documents.embedder.dimensions,
         ),
     )
+
+
+@router.get("/api/ready", response_model=ReadyResponse)
+async def ready(request: Request) -> ReadyResponse:
+    """Readiness: is the document database actually reachable? Never calls an AI provider and exposes no details."""
+    database = await request.app.state.documents.readiness()
+    return ReadyResponse(status="ok" if database in ("ok", "not_configured") else "degraded", database=database)
 
 
 @router.post("/api/chat", response_model=ChatResponse)

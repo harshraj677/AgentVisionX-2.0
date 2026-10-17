@@ -66,6 +66,14 @@ class DocumentsHealth(BaseModel):
     embedding_dimensions: int
 
 
+class ReadyResponse(BaseModel):
+    """Readiness, separate from liveness (/health). Always HTTP 200 when the server itself is up: chat, privacy and
+    research work without a database, so an unavailable database is reported here, not as a failure of the server."""
+
+    status: Literal["ok", "degraded"]
+    database: Literal["not_configured", "ok", "not_migrated", "unavailable"]
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     version: str

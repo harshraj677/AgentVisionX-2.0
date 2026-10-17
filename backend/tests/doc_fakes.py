@@ -55,6 +55,10 @@ class InMemoryDocumentStore:
         self.chunks: dict[str, list[tuple[Chunk, list[float], str, int]]] = {}  # doc -> (chunk, vector, chunk_id, version)
         self.events: list[tuple[str, str, str, dict]] = []
         self.search_calls: list[tuple[str, list[str], int]] = []
+        self.leases: dict[str, datetime] = {}  # doc id -> indexing_started_at (None/absent = no job running)
+        self.clock = lambda: datetime.now(timezone.utc)  # tests move time by replacing this
+        self.ping_result = "ok"
+        self.closed = False
 
     def _check(self):
         if self.fail:
@@ -79,6 +83,7 @@ class InMemoryDocumentStore:
         )
         self.docs[doc.id] = (owner, doc)
         self.pages[doc.id] = list(pages)
+        self.leases[doc.id] = self.clock()
         return replace(doc)
 
     async def get_document(self, owner, document_id):
@@ -103,6 +108,12 @@ class InMemoryDocumentStore:
         self._check()
         doc = self._owned(owner, document_id)
         if doc:
+            if "indexing_started_at" in fields:
+                started = fields.pop("indexing_started_at")
+                if started is None:
+                    self.leases.pop(document_id, None)
+                else:
+                    self.leases[document_id] = started
             fields.pop("privacy_decided_at", None)
             self.docs[document_id] = (owner, replace(doc, **fields))
 
@@ -110,6 +121,7 @@ class InMemoryDocumentStore:
         self._check()
         doc = self._owned(owner, document_id)
         version = doc.index_version + 1
+        self.leases.pop(document_id, None)
         self.chunks[document_id] = [(c, v, str(uuid.uuid4()), version) for c, v in zip(chunks, vectors)]
         new = replace(doc, status="ready", error_code=None, embedding_model=model, embedding_dimensions=dimensions,
                       chunk_count=len(chunks), index_version=version, processed_at=datetime.now(timezone.utc))
@@ -144,6 +156,35 @@ class InMemoryDocumentStore:
     async def add_event(self, owner, document_id, event, details=None):
         self._check()
         self.events.append((owner, document_id, event, dict(details or {})))
+
+    async def claim_indexing(self, owner, document_id, stale_seconds):
+        self._check()
+        if not self._owned(owner, document_id):
+            return False
+        started = self.leases.get(document_id)
+        if started is not None and (self.clock() - started).total_seconds() < stale_seconds:
+            return False
+        self.leases[document_id] = self.clock()
+        return True
+
+    async def recover_stale(self, owner, stale_seconds):
+        self._check()
+        recovered = []
+        for doc_id, (o, doc) in list(self.docs.items()):
+            if o != owner or doc.status != "processing":
+                continue
+            since = self.leases.get(doc_id) or doc.uploaded_at
+            if (self.clock() - since).total_seconds() >= stale_seconds:
+                self.docs[doc_id] = (o, replace(doc, status="failed", error_code="indexing_interrupted", processed_at=self.clock()))
+                self.leases.pop(doc_id, None)
+                recovered.append(doc_id)
+        return recovered
+
+    def close(self):
+        self.closed = True
+
+    async def ping(self):
+        return "unavailable" if self.fail else self.ping_result
 
 
 def _escape(line: str) -> str:

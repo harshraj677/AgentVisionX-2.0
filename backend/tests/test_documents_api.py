@@ -420,3 +420,29 @@ def test_chat_and_research_still_work_alongside_documents():
     r = client.post("/api/chat", json={"messages": [{"role": "user", "content": "Explain recursion"}]})
     assert r.status_code == 200 and r.json()["message"]["content"] == "hi"
     assert client.post("/api/research", json={"question": "How do compilers optimize loops?"}).json()["error"]["code"] == "research_provider_not_configured"
+
+
+def test_a_failed_chunk_write_leaves_a_retryable_failed_document_not_a_stuck_processing_one():
+    """Regression: if storing the chunks failed after embedding, the document stayed 'processing' forever and could
+    neither be re-indexed nor explained in the app. It must become 'failed' (retryable) with a safe error code."""
+    from app.documents.store import StoreUnavailable
+
+    client, store, *_ = build()
+    original = store.store_chunks
+    calls = {"n": 0}
+
+    async def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StoreUnavailable()
+        return await original(*args, **kwargs)
+
+    store.store_chunks = flaky
+    r = upload(client, POLICY_TXT.encode())
+    assert r.status_code in (201, 503)
+    docs = client.get("/api/documents", headers={"X-Document-Scope": SCOPE_A}).json()["documents"]
+    assert len(docs) == 1 and docs[0]["status"] == "failed", docs
+    assert docs[0]["error_code"] == "documents_database_unavailable"
+    assert docs[0]["chunk_count"] == 0
+    retry = client.post(f"/api/documents/{docs[0]['id']}/reindex", headers={"X-Document-Scope": SCOPE_A})
+    assert retry.status_code == 200 and retry.json()["status"] == "ready"

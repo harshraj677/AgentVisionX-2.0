@@ -70,6 +70,30 @@ class DocumentService:
         self.embedder = embedder
         self._dims_ok = False
 
+    @property
+    def stale_after_seconds(self) -> int:
+        """Lease expiry. Never below the worst-case time a healthy job can take, so a running job is never 'recovered'."""
+        batches = -(-self._s.max_chunks_per_document // self._s.embedding_batch_size)
+        worst_case = int(batches * (self._s.embedding_timeout_seconds + 5)) + 60
+        return max(self._s.indexing_stale_seconds, worst_case)
+
+    async def _recover(self, owner: str) -> None:
+        """Fails (never deletes) this owner's documents whose indexing job died. Idempotent; safe under concurrency."""
+        recovered = await self._db(self.store.recover_stale(owner, self.stale_after_seconds))
+        for doc_id in recovered:
+            logger.warning("recovered interrupted indexing doc=%s", doc_id)
+            await self._event(owner, doc_id, "indexing_interrupted")
+
+    async def _release(self, owner: str, doc: DocumentRecord, mark_failed: bool) -> None:
+        """Best effort after an unexpected error: free the lease (and fail a half-created upload) so the user can retry."""
+        try:
+            if mark_failed:
+                await self._fail(owner, doc, "indexing_interrupted")
+            else:
+                await self._db(self.store.update_document(owner, doc.id, indexing_started_at=None))
+        except Exception:
+            pass
+
     # ---- guards ---------------------------------------------------------------------------------------------
 
     def _require_database(self) -> None:
@@ -149,6 +173,13 @@ class DocumentService:
         await self._event(owner, doc.id, "uploaded", {"file_type": file_type, "size_bytes": len(data), "pages": len(pages)})
         logger.info("document uploaded request_id=%s doc=%s type=%s bytes=%d pages=%d", request_id, doc.id, file_type, len(data), len(pages))
 
+        try:
+            return await self._review_and_index(owner, doc, pages, request_id)
+        except Exception:
+            await self._release(owner, doc, mark_failed=True)
+            raise
+
+    async def _review_and_index(self, owner: str, doc: DocumentRecord, pages: list[Page], request_id: str) -> DocumentOut:
         scans = await self._scan(pages)
         if scans is None:
             return await self._fail(owner, doc, "privacy_engine_unavailable")
@@ -162,6 +193,7 @@ class DocumentService:
         categories = dict(Counter(f.category for f in findings))
         await self._db(self.store.update_document(
             owner, doc.id, status="needs_review", privacy_required_action=required, privacy_categories=categories,
+            indexing_started_at=None,
         ))
         await self._event(owner, doc.id, "privacy_review_required", {"decision": decision, "required_action": required, "categories": categories})
         logger.info("document needs privacy review request_id=%s doc=%s required=%s categories=%s", request_id, doc.id, required, categories)
@@ -177,6 +209,15 @@ class DocumentService:
         if decision == "confirm" and doc.privacy_required_action != "confirm":
             raise AppError(422, "privacy_decision_not_allowed", "This document contains information that must be redacted before it can be indexed.")
 
+        if not await self._db(self.store.claim_indexing(owner, doc.id, self.stale_after_seconds)):
+            raise AppError(409, "document_indexing_in_progress", "This document is already being indexed. Wait a moment and refresh.")
+        try:
+            return await self._decide_claimed(owner, doc, decision, request_id)
+        except Exception:
+            await self._release(owner, doc, mark_failed=False)
+            raise
+
+    async def _decide_claimed(self, owner: str, doc: DocumentRecord, decision: str, request_id: str) -> DocumentOut:
         pages = await self._db(self.store.get_pages(owner, doc.id))
         now = datetime.now(timezone.utc)
         if decision == "redact":
@@ -204,14 +245,21 @@ class DocumentService:
         self._require_database()
         self._require_embeddings()
         await self._check_dimensions()
+        await self._recover(owner)  # so a retry right after a crash works even if the list was never reloaded
         doc = await self._get_owned(owner, document_id)
         if doc.status not in ("failed", "ready") or doc.privacy_decision == "none":
             raise AppError(409, "document_not_reindexable", "Only indexed or failed documents whose privacy review is complete can be re-indexed.")
-        pages = await self._db(self.store.get_pages(owner, doc.id))
-        return await self._index(owner, doc.id, pages, request_id)
+        if not await self._db(self.store.claim_indexing(owner, doc.id, self.stale_after_seconds)):
+            raise AppError(409, "document_indexing_in_progress", "This document is already being indexed. Wait a moment and refresh.")
+        try:
+            pages = await self._db(self.store.get_pages(owner, doc.id))
+            return await self._index(owner, doc.id, pages, request_id)
+        except Exception:
+            await self._release(owner, doc, mark_failed=False)
+            raise
 
     async def _fail(self, owner: str, doc: DocumentRecord, code: str) -> DocumentOut:
-        await self._db(self.store.update_document(owner, doc.id, status="failed", error_code=code, processed_at=datetime.now(timezone.utc)))
+        await self._db(self.store.update_document(owner, doc.id, status="failed", error_code=code, processed_at=datetime.now(timezone.utc), indexing_started_at=None))
         await self._event(owner, doc.id, "failed", {"code": code})
         return to_out(await self._get_owned(owner, doc.id))
 
@@ -230,26 +278,47 @@ class DocumentService:
             return await self._fail(owner, doc, exc.code)
         if len(vectors) != len(chunks) or any(len(v) != self._s.embedding_dimensions for v in vectors):
             return await self._fail(owner, doc, "embedding_dimension_mismatch")
-        stored = await self._db(self.store.store_chunks(owner, doc.id, chunks, vectors, self.embedder.model, self.embedder.dimensions))
+        try:
+            stored = await self._db(self.store.store_chunks(owner, doc.id, chunks, vectors, self.embedder.model, self.embedder.dimensions))
+        except AppError as exc:
+            # The write was rolled back. Without this the document would stay 'processing' forever (no retry possible).
+            if exc.code == "documents_database_unavailable":
+                try:
+                    return await self._fail(owner, doc, "documents_database_unavailable")
+                except AppError:
+                    pass  # the database is really down: report the original error
+            raise
         await self._event(owner, doc.id, "indexed", {"chunks": len(chunks), "embedding_model": self.embedder.model})
         logger.info("document indexed request_id=%s doc=%s chunks=%d embed_ms=%d", request_id, doc.id, len(chunks), int((time.perf_counter() - start) * 1000))
         return to_out(stored)
 
     # ---- read / delete -------------------------------------------------------------------------------------------
 
+    async def readiness(self) -> str:
+        """'not_configured' | 'ok' | 'not_migrated' | 'unavailable'. One cheap probe; no provider call, no content."""
+        if not self.store.is_configured():
+            return "not_configured"
+        return await self.store.ping()
+
     async def list(self, owner: str) -> list[DocumentOut]:
         self._require_database()
+        await self._recover(owner)
         return [to_out(d) for d in await self._db(self.store.list_documents(owner))]
 
     async def get(self, owner: str, document_id: str) -> DocumentOut:
         self._require_database()
+        await self._recover(owner)
         return to_out(await self._get_owned(owner, document_id))
 
     async def delete(self, owner: str, document_id: str, request_id: str) -> None:
         self._require_database()
         if not await self._db(self.store.delete_document(owner, document_id)):
             raise AppError(404, "document_not_found", "Document not found.")
-        await self._event(owner, document_id, "deleted")
+        try:
+            await self._event(owner, document_id, "deleted")
+        except AppError:
+            # The document is already gone; failing the request now would make the user think the delete did not happen.
+            logger.warning("audit event for deleted document could not be written doc=%s", document_id)
         logger.info("document deleted request_id=%s doc=%s", request_id, document_id)
 
     # ---- ask ----------------------------------------------------------------------------------------------------

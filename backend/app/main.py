@@ -43,6 +43,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Load the NLP model at startup so the first request isn't slow.
         await asyncio.to_thread(app.state.privacy.detector.warm_up)
         yield
+        close = getattr(app.state.documents.store, "close", None)
+        if close is not None:  # release pooled database connections on shutdown
+            await asyncio.to_thread(close)
 
     app = FastAPI(title="AgentVision X API", version=VERSION, lifespan=lifespan)
     registry = ProviderRegistry(settings)

@@ -209,3 +209,187 @@ def test_real_pgvector_type_dimensions_operator_and_hnsw_index(store):
         assert conn.execute("SELECT '[1,0]'::vector <=> '[0,1]'::vector").fetchone()[0] == pytest.approx(1.0)
         with pytest.raises(psycopg.errors.DataException):
             conn.execute("SELECT '[1,2,3]'::vector(%s)" % DIMS)
+
+
+# ---- Phase 8.9: indexing lease, stale recovery and readiness probe (real PostgreSQL) ----
+
+def _backdate_lease(doc_id, seconds):
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE rag_documents SET indexing_started_at = now() - make_interval(secs => %s) WHERE id = %s", (seconds, doc_id)
+        )
+
+
+def test_claim_indexing_is_atomic_so_only_one_of_many_concurrent_jobs_wins(store):
+    o = new_owner(store)
+    doc, _ = make_doc(store, o)  # create_document takes the lease
+    run(store.update_document(o, doc.id, indexing_started_at=None))  # job finished: lease free
+
+    async def race():
+        return await asyncio.gather(*[store.claim_indexing(o, doc.id, 900) for _ in range(8)])
+
+    results = run(race())
+    assert results.count(True) == 1, results
+
+
+def test_a_live_lease_blocks_claims_and_a_stale_lease_does_not(store):
+    o = new_owner(store)
+    doc, _ = make_doc(store, o)
+    assert run(store.claim_indexing(o, doc.id, 900)) is False  # fresh lease from create_document
+    _backdate_lease(doc.id, 901)
+    assert run(store.claim_indexing(o, doc.id, 900)) is True
+    assert run(store.claim_indexing(o, doc.id, 900)) is False  # and the new owner of the lease is protected again
+
+
+def test_recover_stale_fails_only_expired_processing_documents_of_the_same_owner_and_keeps_all_data(store):
+    a, b = new_owner(store), new_owner(store)
+    stale_a, _ = make_doc(store, a)
+    fresh_a, _ = make_doc(store, a)
+    stale_b, _ = make_doc(store, b)
+    _backdate_lease(stale_a.id, 1000)
+    _backdate_lease(stale_b.id, 1000)
+    assert run(store.recover_stale(a, 900)) == [stale_a.id]  # not fresh_a (live job), not stale_b (other owner)
+    assert run(store.get_document(a, stale_a.id)).status == "failed"
+    assert run(store.get_document(a, stale_a.id)).error_code == "indexing_interrupted"
+    assert run(store.get_document(a, fresh_a.id)).status == "processing"
+    assert run(store.get_document(b, stale_b.id)).status == "processing"
+    assert len(run(store.get_pages(a, stale_a.id))) == 2  # nothing was deleted
+    assert run(store.recover_stale(a, 900)) == []  # idempotent
+
+
+def test_recovery_falls_back_to_upload_time_for_rows_without_a_lease(store):
+    import psycopg
+
+    o = new_owner(store)
+    doc, _ = make_doc(store, o)
+    with psycopg.connect(DSN, autocommit=True) as conn:  # a legacy row: no lease, uploaded long ago
+        conn.execute("UPDATE rag_documents SET indexing_started_at = NULL, uploaded_at = now() - interval '2 hours' WHERE id = %s", (doc.id,))
+    assert run(store.recover_stale(o, 900)) == [doc.id]
+
+
+def test_store_chunks_releases_the_lease(store):
+    import psycopg
+
+    o = new_owner(store)
+    doc, _ = make_doc(store, o)
+    run(store.store_chunks(o, doc.id, [Chunk(0, 1, "alpha text")], [vec(3)], "m", DIMS))
+    with psycopg.connect(DSN) as conn:
+        assert conn.execute("SELECT indexing_started_at FROM rag_documents WHERE id = %s", (doc.id,)).fetchone()[0] is None
+
+
+def test_ping_reports_ok_for_a_migrated_database_and_unavailable_for_a_dead_one_without_leaking_details(store):
+    import time
+
+    assert run(store.ping()) == "ok"
+    dead = PostgresDocumentStore("postgresql://nobody:secret-pw@127.0.0.1:1/avx_test")
+    start = time.perf_counter()
+    assert run(dead.ping()) == "unavailable"
+    assert time.perf_counter() - start < 6  # bounded by connect_timeout, never hangs
+    assert run(PostgresDocumentStore(None).ping()) == "unavailable"
+
+
+# ---- Phase 8.10: the connection pool must recover when the database was down at first use ----
+
+class _Forwarder:
+    """A TCP forwarder to the test database that can start late, to simulate 'database down, then back up'."""
+
+    def __init__(self):
+        import socket
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        self.port = probe.getsockname()[1]
+        probe.close()
+        self._listener = None
+        self._open = []
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(DSN)
+        self._target = (parts.hostname, parts.port)
+        self.dsn = DSN.replace(f":{parts.port}/", f":{self.port}/")
+
+    def start(self):
+        import socket
+        import threading
+
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", self.port))
+        self._listener.listen(8)
+
+        def pump(a, b):
+            try:
+                while data := a.recv(65536):
+                    b.sendall(data)
+            except OSError:
+                pass
+            finally:
+                for s in (a, b):
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+        def accept():
+            while True:
+                try:
+                    client, _ = self._listener.accept()
+                except OSError:
+                    return
+                upstream = socket.create_connection(self._target)
+                self._open += [client, upstream]
+                threading.Thread(target=pump, args=(client, upstream), daemon=True).start()
+                threading.Thread(target=pump, args=(upstream, client), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+
+    def stop(self):
+        if self._listener:
+            self._listener.close()
+        for s in self._open:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+def test_store_recovers_when_the_database_was_down_at_first_use():
+    """Regression: a pool that failed its first connection used to stay cached closed (PoolClosed) until the backend
+    was restarted. It must fail fast while the database is down and work once the database is back."""
+    import time
+
+    from app.documents.store import StoreUnavailable
+
+    fwd = _Forwarder()
+    s = PostgresDocumentStore(fwd.dsn)
+    try:
+        start = time.perf_counter()
+        with pytest.raises(StoreUnavailable):
+            run(s.list_documents(owner()))
+        assert time.perf_counter() - start < 12  # bounded; no 15 s hang
+        fwd.start()  # the database 'comes back'
+        deadline = time.time() + 30
+        last = None
+        while time.time() < deadline:
+            try:
+                assert run(s.list_documents(owner())) == []
+                last = None
+                break
+            except StoreUnavailable as exc:
+                last = exc
+                time.sleep(1)
+        assert last is None, "store never recovered after the database came back"
+    finally:
+        s.close()
+        fwd.stop()
+
+
+def test_close_is_idempotent_and_the_store_can_be_used_again_afterwards(store):
+    s = PostgresDocumentStore(DSN)
+    assert run(s.list_documents(owner())) == []
+    s.close()
+    s.close()
+    assert run(s.list_documents(owner())) == []  # a new pool is created on demand
+    s.close()

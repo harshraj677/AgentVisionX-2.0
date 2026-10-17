@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     embedding_batch_size: int = Field(default=32, ge=1, le=100)
     embedding_timeout_seconds: float = Field(default=30, gt=0, le=120)
     document_max_upload_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=50 * 1024 * 1024)
+    # How long an indexing job may hold its lease before it is treated as crashed. The service never goes below the
+    # worst-case duration implied by the embedding timeout and chunk limits, so a running job is not recovered.
+    indexing_stale_seconds: int = Field(default=900, ge=120, le=86_400)
     document_max_pages: int = Field(default=300, ge=1, le=2000)
     document_max_extracted_chars: int = Field(default=300_000, ge=1000, le=2_000_000)
     document_min_text_chars: int = Field(default=20, ge=1, le=10_000)

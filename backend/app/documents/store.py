@@ -5,6 +5,7 @@ cannot run on Windows' default event loop). Database errors become StoreUnavaila
 import asyncio
 import json
 import logging
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -65,6 +66,9 @@ class DocumentStore(Protocol):
     async def search(self, owner: str, document_ids: list[str], vector: list[float], limit: int) -> list[RetrievedChunk]: ...
     async def delete_document(self, owner: str, document_id: str) -> bool: ...
     async def add_event(self, owner: str, document_id: str, event: str, details: dict | None = None) -> None: ...
+    async def claim_indexing(self, owner: str, document_id: str, stale_seconds: int) -> bool: ...
+    async def recover_stale(self, owner: str, stale_seconds: int) -> list[str]: ...
+    async def ping(self) -> str: ...
 
 
 def _vector_literal(vector: list[float]) -> str:
@@ -78,7 +82,7 @@ _COLUMNS = (
 )
 _UPDATABLE = {
     "status", "error_code", "privacy_required_action", "privacy_decision", "privacy_categories", "privacy_decided_at",
-    "processed_at", "page_count", "char_count",
+    "processed_at", "page_count", "char_count", "indexing_started_at",
 }
 
 
@@ -102,17 +106,33 @@ class PostgresDocumentStore:
     def __init__(self, dsn: str | None):
         self._dsn = dsn
         self._pool = None
+        self._pool_lock = threading.Lock()  # _run executes in worker threads: create the pool exactly once
 
     def is_configured(self) -> bool:
         return bool(self._dsn)
 
     def _get_pool(self):
-        if self._pool is None:
-            from psycopg_pool import ConnectionPool
+        with self._pool_lock:
+            if self._pool is None:
+                from psycopg_pool import ConnectionPool
 
-            self._pool = ConnectionPool(self._dsn, min_size=1, max_size=5, timeout=10, open=False)
-            self._pool.open(wait=True, timeout=10)
-        return self._pool
+                pool = ConnectionPool(
+                    self._dsn, min_size=1, max_size=5, timeout=5, open=False, kwargs={"connect_timeout": 3}
+                )
+                # Do not wait for the first connection: a pool that failed its initial wait used to be cached closed,
+                # so a database that was down at first use stayed unusable until the backend restarted. Opened without
+                # waiting, the pool keeps retrying in the background and recovers when the database returns; each
+                # request waits at most `timeout` seconds and then fails with StoreUnavailable.
+                pool.open()
+                self._pool = pool
+            return self._pool
+
+    def close(self) -> None:
+        """Releases pooled connections (called on application shutdown). Safe to call repeatedly."""
+        with self._pool_lock:
+            pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.close()
 
     async def _run(self, fn):
         def work():
@@ -140,8 +160,8 @@ class PostgresDocumentStore:
 
         def fn(conn):
             row = conn.execute(
-                f"INSERT INTO rag_documents (id, owner_scope, filename, file_type, size_bytes, page_count, char_count, status) "
-                f"VALUES (%s, %s, %s, %s, %s, %s, %s, 'processing') RETURNING {_COLUMNS}",
+                f"INSERT INTO rag_documents (id, owner_scope, filename, file_type, size_bytes, page_count, char_count, status, indexing_started_at) "
+                f"VALUES (%s, %s, %s, %s, %s, %s, %s, 'processing', now()) RETURNING {_COLUMNS}",
                 (doc_id, owner, filename, file_type, size_bytes, len(pages), sum(len(p.text) for p in pages)),
             ).fetchone()
             with conn.cursor() as cur:
@@ -233,7 +253,7 @@ class PostgresDocumentStore:
             conn.execute("DELETE FROM rag_chunks WHERE document_id = %s AND index_version < %s", (did, version))
             updated = conn.execute(
                 f"UPDATE rag_documents SET status = 'ready', error_code = NULL, embedding_model = %s, embedding_dimensions = %s, "
-                f"chunk_count = %s, index_version = %s, processed_at = now() WHERE id = %s AND owner_scope = %s RETURNING {_COLUMNS}",
+                f"chunk_count = %s, index_version = %s, processed_at = now(), indexing_started_at = NULL WHERE id = %s AND owner_scope = %s RETURNING {_COLUMNS}",
                 (model, dimensions, len(chunks), version, did, owner),
             ).fetchone()
             return _record(updated)
@@ -280,3 +300,53 @@ class PostgresDocumentStore:
             )
 
         await self._run(fn)
+
+    async def claim_indexing(self, owner, document_id, stale_seconds):
+        """Atomically takes the indexing lease. False if a live (non-stale) job holds it or the document is not this owner's."""
+        did = _uuid(document_id)
+        if did is None:
+            return False
+
+        def fn(conn):
+            row = conn.execute(
+                "UPDATE rag_documents SET indexing_started_at = now() WHERE id = %s AND owner_scope = %s "
+                "AND (indexing_started_at IS NULL OR indexing_started_at < now() - make_interval(secs => %s)) RETURNING id",
+                (did, owner, stale_seconds),
+            ).fetchone()
+            return row is not None
+
+        return await self._run(fn)
+
+    async def recover_stale(self, owner, stale_seconds):
+        """Marks this owner's 'processing' documents whose lease expired as failed (retryable). Deletes nothing."""
+
+        def fn(conn):
+            rows = conn.execute(
+                "UPDATE rag_documents SET status = 'failed', error_code = 'indexing_interrupted', indexing_started_at = NULL, "
+                "processed_at = now() WHERE owner_scope = %s AND status = 'processing' "
+                "AND COALESCE(indexing_started_at, uploaded_at) < now() - make_interval(secs => %s) RETURNING id",
+                (owner, stale_seconds),
+            ).fetchall()
+            return [str(r[0]) for r in rows]
+
+        return await self._run(fn)
+
+    async def ping(self):
+        """Cheap readiness probe on its own short-timeout connection (never waits on the pool).
+        Returns 'ok', 'not_migrated' or 'unavailable'. Never raises and never exposes driver text."""
+        if not self._dsn:
+            return "unavailable"
+
+        def work():
+            import psycopg
+
+            try:
+                with psycopg.connect(self._dsn, connect_timeout=3, autocommit=True) as conn:
+                    conn.execute("SET statement_timeout = 3000")
+                    row = conn.execute("SELECT to_regclass('public.rag_meta') IS NOT NULL").fetchone()
+                    return "ok" if row and row[0] else "not_migrated"
+            except Exception as exc:
+                logger.warning("document store ping failed: %s", type(exc).__name__)
+                return "unavailable"
+
+        return await asyncio.to_thread(work)
