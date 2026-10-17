@@ -1,6 +1,8 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 
+import { normalizeApiUrl } from './validate';
+
 const STORAGE_KEY = 'agentvision.apiUrl.v1';
 
 // 10.0.2.2 is how the Android emulator reaches the PC's localhost.
@@ -18,7 +20,9 @@ export function getApiUrl(): string {
 export async function initApiUrl(): Promise<void> {
   try {
     const saved = await AsyncStorage.getItem(STORAGE_KEY);
-    if (saved) currentUrl = saved;
+    // A URL saved by an older version may lack "http://"; normalise it, and ignore a value that cannot be used.
+    const checked = saved ? normalizeApiUrl(saved) : null;
+    if (checked?.ok && checked.url) currentUrl = checked.url;
   } catch {
     // Storage unavailable: keep the default.
   }

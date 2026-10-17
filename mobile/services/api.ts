@@ -15,7 +15,7 @@ import type { ResearchRequest, ResearchResponse } from '@/types/research';
 
 import { getApiUrl } from './config';
 import { getDocumentScope } from './documentScope';
-import { INVALID_RESPONSE_MESSAGE, expectObject, networkErrorMessage, validateChat, validateDocumentList, validateHealth, validateReady } from './validate';
+import { INVALID_RESPONSE_MESSAGE, expectObject, networkErrorMessage, timeoutMessage, validateChat, validateDocumentList, validateHealth, validateReady } from './validate';
 
 export class ApiError extends Error {
   constructor(
@@ -50,7 +50,7 @@ async function request<T>(
       throw new ApiError('Stopped waiting for the server.', 'cancelled');
     }
     if (controller.signal.aborted) {
-      throw new ApiError('The request timed out. Please try again.', 'timeout');
+      throw new ApiError(timeoutMessage(getApiUrl()), 'timeout');
     }
     throw new ApiError(networkErrorMessage(getApiUrl()), 'network_error');
   } finally {

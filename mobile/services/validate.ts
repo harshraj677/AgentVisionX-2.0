@@ -79,3 +79,24 @@ export function describeDatabase(state: string): { ok: boolean; text: string } {
       return { ok: false, text: 'The backend cannot reach its documents database. Check that PostgreSQL (Docker) is running. Chat still works.' };
   }
 }
+
+/** Timeout text for requests that got no answer in time. Tells the user what to check, not just that it failed. */
+export function timeoutMessage(apiUrl: string): string {
+  return `The backend at ${apiUrl} did not answer in time. Check that the PC is awake and the backend is running, that the phone is on the same Wi-Fi, then try again.`;
+}
+
+/** Short headline for a failed connection check, from the error code of the request. */
+export function connectionFailureTitle(code: string | undefined): string {
+  switch (code) {
+    case 'timeout':
+      return 'Backend timed out';
+    case 'network_error':
+      return 'Backend unreachable';
+    case 'invalid_response':
+      return 'Not an AgentVision X backend';
+    case 'cancelled':
+      return 'Check cancelled';
+    default:
+      return 'Backend returned an error';
+  }
+}

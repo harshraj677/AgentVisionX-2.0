@@ -3,7 +3,7 @@ import { ApiError } from '@/services/api';
 const MESSAGES: Record<string, string> = {
   documents_database_not_configured: 'Documents are not set up on the server (no DATABASE_URL). See the README.',
   documents_database_not_migrated: 'The document tables are missing on the server. Run: python -m app.db.migrate',
-  documents_database_unavailable: 'The document database is unavailable. Try again later.',
+  documents_database_unavailable: 'The document database is unavailable.',
   embedding_not_configured: 'Indexing is not set up on the server (no embedding API key).',
   embedding_dimension_mismatch: 'Server misconfiguration: embedding size does not match the database.',
   embedding_rate_limited: 'The embedding service is rate limited. Retry indexing later.',
@@ -27,7 +27,7 @@ const MESSAGES: Record<string, string> = {
   document_not_found: 'Document not found. It may have been deleted.',
   document_not_ready: 'A selected document is not indexed yet.',
   documents_insufficient_evidence: 'The selected documents do not contain passages relevant enough to answer this.',
-  indexing_interrupted: 'Indexing was interrupted (the server restarted or stopped). Tap Retry indexing if it is shown; otherwise delete the document and upload it again.',
+  indexing_interrupted: 'Indexing was interrupted (the server restarted or stopped).',
   document_indexing_in_progress: 'This document is already being indexed. Wait a moment, then pull down to refresh.',
   document_not_reindexable: 'This document cannot be re-indexed right now.',
   cancelled: 'The app stopped waiting. The server may still finish what it started.',

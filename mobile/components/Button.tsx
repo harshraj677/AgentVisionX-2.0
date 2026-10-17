@@ -8,15 +8,18 @@ interface Props {
   variant?: 'primary' | 'secondary' | 'danger';
   loading?: boolean;
   disabled?: boolean;
+  /** Screen-reader name when the visible label is not specific enough (e.g. "Ask" on a list of documents). */
+  accessibilityLabel?: string;
 }
 
-export function Button({ label, onPress, variant = 'primary', loading, disabled }: Props) {
+export function Button({ label, onPress, variant = 'primary', loading, disabled, accessibilityLabel }: Props) {
   const inactive = disabled || loading;
   const textColor = variant === 'primary' ? colors.textOnPrimary : variant === 'danger' ? colors.danger : colors.primary;
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityState={{ disabled: !!inactive }}
+      accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityState={{ disabled: !!inactive, busy: !!loading }}
       disabled={inactive}
       onPress={onPress}
       style={({ pressed }) => [

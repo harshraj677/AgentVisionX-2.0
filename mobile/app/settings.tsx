@@ -22,7 +22,7 @@ import { colors, font, radius, spacing } from '@/constants/theme';
 import { useConversations } from '@/hooks/ConversationsContext';
 import { useHealth } from '@/hooks/useHealth';
 import { DEFAULT_API_URL, getApiUrl, setApiUrl } from '@/services/config';
-import { describeDatabase, normalizeApiUrl } from '@/services/validate';
+import { connectionFailureTitle, describeDatabase, normalizeApiUrl } from '@/services/validate';
 import { getOptimizerEnabled, setOptimizerEnabled } from '@/services/preferences';
 
 export default function SettingsScreen() {
@@ -43,6 +43,7 @@ export default function SettingsScreen() {
   };
 
   const saveAndTest = async () => {
+    if (health.status === 'checking') return; // a check is already running
     const checked = normalizeApiUrl(url);
     if (!checked.ok) {
       setUrlError(checked.reason);
@@ -92,21 +93,35 @@ export default function SettingsScreen() {
                 {describeDatabase(health.database).text}
               </Text>
             ) : null}
-            {health.status === 'offline' ? <Text style={styles.error}>{health.error}</Text> : null}
+            {health.status === 'offline' ? (
+              <View accessibilityRole="alert" accessibilityLiveRegion="polite">
+                <Text style={[styles.error, { fontWeight: '700', marginBottom: 2 }]}>{connectionFailureTitle(health.errorCode)}</Text>
+                <Text style={[styles.error, { marginTop: 0 }]}>{health.error}</Text>
+              </View>
+            ) : null}
 
             <Text style={styles.fieldLabel}>Backend URL</Text>
             <TextInput
               style={styles.input}
               value={url}
-              onChangeText={setUrl}
+              onChangeText={(v) => {
+                setUrl(v);
+                if (urlError) setUrlError(null);
+              }}
               autoCapitalize="none"
               autoCorrect={false}
               keyboardType="url"
+              returnKeyType="done"
+              onSubmitEditing={() => void saveAndTest()}
+              editable={health.status !== 'checking'}
               placeholder={DEFAULT_API_URL}
               placeholderTextColor={colors.textMuted}
               accessibilityLabel="Backend URL"
             />
-            {urlError ? <Text style={styles.error}>{urlError}</Text> : null}
+            {urlError ? <Text style={styles.error} accessibilityRole="alert">{urlError}</Text> : null}
+            {getApiUrl() !== DEFAULT_API_URL ? (
+              <Text style={font.small}>Using the URL saved on this device. The app default is {DEFAULT_API_URL}; Reset returns to it.</Text>
+            ) : null}
             <Text style={font.small}>
               Emulator: http://10.0.2.2:8000 · Physical phone: http://YOUR-PC-IP:8000
             </Text>
