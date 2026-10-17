@@ -27,6 +27,9 @@ const MESSAGES: Record<string, string> = {
   document_not_found: 'Document not found. It may have been deleted.',
   document_not_ready: 'A selected document is not indexed yet.',
   documents_insufficient_evidence: 'The selected documents do not contain passages relevant enough to answer this.',
+  indexing_interrupted: 'Indexing was interrupted (the server restarted or stopped). Tap Retry indexing if it is shown; otherwise delete the document and upload it again.',
+  document_indexing_in_progress: 'This document is already being indexed. Wait a moment, then pull down to refresh.',
+  document_not_reindexable: 'This document cannot be re-indexed right now.',
   cancelled: 'The app stopped waiting. The server may still finish what it started.',
 };
 

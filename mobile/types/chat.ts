@@ -169,6 +169,14 @@ export interface ChatResponse {
   metadata: ResponseMetadata;
 }
 
+export type DatabaseState = 'not_configured' | 'ok' | 'not_migrated' | 'unavailable';
+
+/** GET /api/ready: whether the backend can actually reach its documents database (separate from /health liveness). */
+export interface ReadyResponse {
+  status: 'ok' | 'degraded';
+  database: DatabaseState;
+}
+
 export interface HealthResponse {
   status: 'ok';
   version: string;

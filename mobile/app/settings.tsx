@@ -22,6 +22,7 @@ import { colors, font, radius, spacing } from '@/constants/theme';
 import { useConversations } from '@/hooks/ConversationsContext';
 import { useHealth } from '@/hooks/useHealth';
 import { DEFAULT_API_URL, getApiUrl, setApiUrl } from '@/services/config';
+import { describeDatabase, normalizeApiUrl } from '@/services/validate';
 import { getOptimizerEnabled, setOptimizerEnabled } from '@/services/preferences';
 
 export default function SettingsScreen() {
@@ -30,6 +31,7 @@ export default function SettingsScreen() {
   const { clearAll, conversations } = useConversations();
   const [url, setUrl] = useState(getApiUrl());
   const [optimizer, setOptimizer] = useState(true);
+  const [urlError, setUrlError] = useState<string | null>(null);
 
   useEffect(() => {
     void getOptimizerEnabled().then(setOptimizer);
@@ -41,12 +43,19 @@ export default function SettingsScreen() {
   };
 
   const saveAndTest = async () => {
-    await setApiUrl(url);
+    const checked = normalizeApiUrl(url);
+    if (!checked.ok) {
+      setUrlError(checked.reason);
+      return;
+    }
+    setUrlError(null);
+    await setApiUrl(checked.url);
     setUrl(getApiUrl());
     await refresh();
   };
 
   const resetUrl = async () => {
+    setUrlError(null);
     await setApiUrl('');
     setUrl(getApiUrl());
     await refresh();
@@ -78,6 +87,11 @@ export default function SettingsScreen() {
                 ))}
               </View>
             ) : null}
+            {health.status === 'online' && health.database ? (
+              <Text style={[font.small, { color: describeDatabase(health.database).ok ? colors.success : colors.warning }]}>
+                {describeDatabase(health.database).text}
+              </Text>
+            ) : null}
             {health.status === 'offline' ? <Text style={styles.error}>{health.error}</Text> : null}
 
             <Text style={styles.fieldLabel}>Backend URL</Text>
@@ -92,6 +106,7 @@ export default function SettingsScreen() {
               placeholderTextColor={colors.textMuted}
               accessibilityLabel="Backend URL"
             />
+            {urlError ? <Text style={styles.error}>{urlError}</Text> : null}
             <Text style={font.small}>
               Emulator: http://10.0.2.2:8000 · Physical phone: http://YOUR-PC-IP:8000
             </Text>
@@ -103,6 +118,7 @@ export default function SettingsScreen() {
                 <Button label="Reset" variant="secondary" onPress={resetUrl} />
               </View>
             </View>
+            <Button label="Check connection" variant="secondary" onPress={() => void refresh()} loading={health.status === 'checking'} />
           </Card>
 
           <Text style={styles.section}>MODEL ROUTING</Text>

@@ -1,5 +1,6 @@
 import type {
   ChatResponse,
+  ReadyResponse,
   HealthResponse,
   OptimizeResult,
   PrivacyRedactResult,
@@ -14,7 +15,7 @@ import type { ResearchRequest, ResearchResponse } from '@/types/research';
 
 import { getApiUrl } from './config';
 import { getDocumentScope } from './documentScope';
-import { INVALID_RESPONSE_MESSAGE, expectObject, validateChat, validateDocumentList, validateHealth } from './validate';
+import { INVALID_RESPONSE_MESSAGE, expectObject, networkErrorMessage, validateChat, validateDocumentList, validateHealth, validateReady } from './validate';
 
 export class ApiError extends Error {
   constructor(
@@ -51,10 +52,7 @@ async function request<T>(
     if (controller.signal.aborted) {
       throw new ApiError('The request timed out. Please try again.', 'timeout');
     }
-    throw new ApiError(
-      `Cannot reach the backend at ${getApiUrl()}. Check that it is running and the URL in Settings is correct.`,
-      'network_error',
-    );
+    throw new ApiError(networkErrorMessage(getApiUrl()), 'network_error');
   } finally {
     clearTimeout(timer);
     external?.removeEventListener('abort', onExternalAbort);
@@ -87,6 +85,11 @@ async function request<T>(
 
 export function checkHealth(): Promise<HealthResponse> {
   return request<HealthResponse>('/health', { method: 'GET' }, 6000, undefined, validateHealth);
+}
+
+/** Readiness: can the backend reach its documents database? One cheap call, made only when the user checks. */
+export function checkReady(): Promise<ReadyResponse> {
+  return request<ReadyResponse>('/api/ready', { method: 'GET' }, 8000, undefined, validateReady);
 }
 
 export function sendChat(
