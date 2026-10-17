@@ -14,6 +14,7 @@ import type { ResearchRequest, ResearchResponse } from '@/types/research';
 
 import { getApiUrl } from './config';
 import { getDocumentScope } from './documentScope';
+import { INVALID_RESPONSE_MESSAGE, expectObject, validateChat, validateDocumentList, validateHealth } from './validate';
 
 export class ApiError extends Error {
   constructor(
@@ -27,7 +28,13 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init: RequestInit, timeoutMs: number, external?: AbortSignal): Promise<T> {
+async function request<T>(
+  path: string,
+  init: RequestInit,
+  timeoutMs: number,
+  external?: AbortSignal,
+  validate: (body: unknown) => void = expectObject,
+): Promise<T> {
   const url = `${getApiUrl()}${path}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -69,11 +76,17 @@ async function request<T>(path: string, init: RequestInit, timeoutMs: number, ex
       err?.details,
     );
   }
+  if (response.status === 204) return null as T;
+  try {
+    validate(body); // a 200 that is not our JSON (captive portal, proxy, wrong server) must not reach the UI
+  } catch {
+    throw new ApiError(INVALID_RESPONSE_MESSAGE, 'invalid_response', response.status);
+  }
   return body as T;
 }
 
 export function checkHealth(): Promise<HealthResponse> {
-  return request<HealthResponse>('/health', { method: 'GET' }, 6000);
+  return request<HealthResponse>('/health', { method: 'GET' }, 6000, undefined, validateHealth);
 }
 
 export function sendChat(
@@ -97,6 +110,8 @@ export function sendChat(
       }),
     },
     100000, // the server may try one fallback model (see ROUTER_TOTAL_TIMEOUT_SECONDS)
+    undefined,
+    validateChat,
   );
 }
 
@@ -136,7 +151,7 @@ async function scoped(init: RequestInit = {}): Promise<RequestInit> {
 }
 
 export async function listDocuments(): Promise<DocumentInfo[]> {
-  const res = await request<{ documents: DocumentInfo[] }>('/api/documents', await scoped({ method: 'GET' }), 15000);
+  const res = await request<{ documents: DocumentInfo[] }>('/api/documents', await scoped({ method: 'GET' }), 15000, undefined, validateDocumentList);
   return res.documents;
 }
 
